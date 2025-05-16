@@ -3,21 +3,63 @@ import pickle
 import torch
 from transformers import AutoModelForCausalLM
 from tqdm import tqdm
+from deepspeed import init_inference
 
 from deepseek_vl2.models import DeepseekVLV2Processor, DeepseekVLV2ForCausalLM
 from deepseek_vl2.utils.io import load_pil_images
 
+model_path = "deepseek-ai/deepseek-vl2-tiny"
+size_per_device_GB = 4
+num_device = torch.cuda.device_count()
+
+def split_model(model_name):
+    device_map = {}
+    model_splits = {        
+        'deepseek-ai/deepseek-vl2-tiny': [13, 14], # 2 GPU
+        'deepseek-ai/deepseek-vl2-small': [13, 14], # 2 GPU 
+        'deepseek-ai/deepseek-vl2': [13, 14], # 2 GPU
+    }
+    num_layers_per_gpu = model_splits[model_name]
+    num_layers = sum(num_layers_per_gpu)
+    layer_cnt = 0
+    for i, num_layer in enumerate(num_layers_per_gpu):
+        for j in range(num_layer):
+            device_map[f'language.model.layers.{layer_cnt}'] = i 
+            layer_cnt += 1
+    device_map['vision'] = 0
+    device_map['projector'] = 0
+    device_map['image_newline'] = 0
+    device_map['view_seperator'] = 0
+    device_map['language.model.embed_tokens'] = 0
+    device_map['language.model.norm'] = 0
+    device_map['language.lm_head'] = 0
+    device_map[f'language.model.layers.{num_layers - 1}'] = 0
+    return device_map
+
 def get_model():
     # specify the path to the model
-    model_path = "deepseek-ai/deepseek-vl2-tiny"
     vl_chat_processor: DeepseekVLV2Processor = DeepseekVLV2Processor.from_pretrained(model_path)
     tokenizer = vl_chat_processor.tokenizer
+    vl_gpt: DeepseekVLV2ForCausalLM = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True
+    ).cuda().to(torch.bfloat16)
+    # 封装language
+    vl_gpt_language = init_inference(
+        vl_gpt.language,
+        mp_size=1,
+        dtype=torch.bfloat16,
+        replace_with_kernel_inject=True
+    )
+    vl_gpt.eval()
 
-    vl_gpt: DeepseekVLV2ForCausalLM = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
-    vl_gpt = vl_gpt.to(torch.bfloat16).cuda().eval()
-    return vl_gpt, vl_chat_processor, tokenizer
+    # device_map = split_model(model_path)
+    # model: DeepseekVLV2ForCausalLM = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, device_map=device_map)
+    # vl_gpt = model.to(torch.bfloat16).cuda().eval()
 
-def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_chat_processor, tokenizer):
+    return vl_gpt, vl_gpt_language, vl_chat_processor, tokenizer
+
+def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_gpt_language, vl_chat_processor, tokenizer):
     # 读取pkl的数据
     with open(os.path.join(path_GenAD, path_pkl), 'rb') as f:
         datas_from_pkl = pickle.load(f)
@@ -51,14 +93,14 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_chat_p
         key_motion = 'The description should only focuse on the motion information of other objects and ignore the map information.' \
                      'Please detect and describe the types and possible motion states of the objects in the scene.'
         key_map = 'The description should only focuse on the map information, which includes [lane divider, road boundary and pedestrian crossing], and ignore the object information.' \
-                  'Please detect and describe the structure, types, traffic signs, traffic rules and existing signs of the current road.'
+                  'Please detect and describe the ground markings, road types and traffic signs of the current road.'
         keys = [key_all, key_motion, key_map]
         preset = ""
         for cp in camera_positions:
             preset += f"This is image from {cp}: <image>\n"
         preset = preset + \
                 "These pictures are images from six perspectives provided by the ego vehicle. " \
-                "You need to parse images from different perspectives and generate a detailed textual description of the current scene. " \
+                "You need to parse images from different perspectives and generate a unified and uninterrupted textual description of the current scene. " \
                 "Please pay attention to distinguishing images from different perspectives " \
                 "and reasoning out the correct positional relationship between the objects and the ego vehicle in the picture. " \
 
@@ -90,7 +132,7 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_chat_p
             inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
 
             # run the model to get the response
-            outputs = vl_gpt.language.generate(
+            outputs = vl_gpt_language.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=prepare_inputs.attention_mask,
                 pad_token_id=tokenizer.eos_token_id,
@@ -98,7 +140,7 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_chat_p
                 eos_token_id=tokenizer.eos_token_id,
                 max_new_tokens=512,
                 do_sample=False,
-                use_cache=True
+                use_cache=False
             )
 
             answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
@@ -119,7 +161,7 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_chat_p
 
 if __name__ == '__main__':
     # load the model
-    vl_gpt, vl_chat_processor, tokenizer = get_model()
+    models = get_model()
 
     path_GenAD = '../GenAD'
     path_datas_pkl = [
@@ -134,4 +176,5 @@ if __name__ == '__main__':
     ]
 
     for path_pkl, path_pkl_new in zip(path_datas_pkl, path_datas_pkl_new):
-            process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_chat_processor, tokenizer)
+        with torch.no_grad():
+            process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, *models)
