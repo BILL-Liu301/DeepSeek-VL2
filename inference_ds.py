@@ -1,6 +1,7 @@
 import os
 import pickle
 import torch
+import copy
 from transformers import AutoModelForCausalLM
 from tqdm import tqdm
 from deepspeed import init_inference
@@ -11,30 +12,7 @@ from deepseek_vl2.utils.io import load_pil_images
 model_path = "deepseek-ai/deepseek-vl2-tiny"
 size_per_device_GB = 4
 num_device = torch.cuda.device_count()
-
-def split_model(model_name):
-    device_map = {}
-    model_splits = {        
-        'deepseek-ai/deepseek-vl2-tiny': [13, 14], # 2 GPU
-        'deepseek-ai/deepseek-vl2-small': [13, 14], # 2 GPU 
-        'deepseek-ai/deepseek-vl2': [13, 14], # 2 GPU
-    }
-    num_layers_per_gpu = model_splits[model_name]
-    num_layers = sum(num_layers_per_gpu)
-    layer_cnt = 0
-    for i, num_layer in enumerate(num_layers_per_gpu):
-        for j in range(num_layer):
-            device_map[f'language.model.layers.{layer_cnt}'] = i 
-            layer_cnt += 1
-    device_map['vision'] = 0
-    device_map['projector'] = 0
-    device_map['image_newline'] = 0
-    device_map['view_seperator'] = 0
-    device_map['language.model.embed_tokens'] = 0
-    device_map['language.model.norm'] = 0
-    device_map['language.lm_head'] = 0
-    device_map[f'language.model.layers.{num_layers - 1}'] = 0
-    return device_map
+max_new_tokens = 512
 
 def get_model():
     # specify the path to the model
@@ -89,43 +67,77 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_gpt_la
             images_path.append(data_path_)
         
         # 设定输入的文本
-        key_all = 'The description should include information such as future predictions, objects, traffic signs, traffic signals and the road structure in the scene. '
-        key_motion = 'The description should only focuse on the motion information of other objects and ignore the map information.' \
-                     'Please detect and describe the types and possible motion states of the objects in the scene.'
-        key_map = 'The description should only focuse on the map information, which includes [lane divider, road boundary and pedestrian crossing], and ignore the object information.' \
-                  'Please detect and describe the ground markings, road types and traffic signs of the current road.'
+        system_prompt = (
+            "You are an intelligent autonomous driving assistant. "
+            "Your goal is to generate a comprehensive and unified textual description of the driving scene "
+            "based on multiple images from different surrounding cameras on the ego vehicle. "
+            "You must reason about the 3D spatial layout and include all critical elements in the environment."
+        )
+        # 预设部分content
+        content_preset = (
+            "Here are six images captured simultaneously from a 360-degree surround-view camera system on the ego vehicle: " + "<image>" * 6 + ". "
+            "These correspond to: CAM_FRONT, CAM_FRONT_RIGHT, CAM_BACK_RIGHT, CAM_BACK, CAM_BACK_LEFT, CAM_FRONT_LEFT. "
+            "Generate a single unified paragraph that summarizes the current scene from all viewpoints. "
+            "Do not describe images individually. Instead, integrate the visual information to reason about the environment, positions of objects, and scene layout relative to the ego vehicle."
+        )
+        # 设置不同key
+        # key_all = (
+        #     "Describe the scene completely, including dynamic objects (vehicles, pedestrians, bicycles), "
+        #     "their relative positions to the ego vehicle, road structures (lane dividers, boundaries, intersections), "
+        #     "traffic signs and lights, and make predictions about the motion of dynamic objects."
+        # )
+        # key_motion = (
+        #     "Focus only on dynamic objects. "
+        #     "Ignore all map elements such as lane dividers and traffic signs. "
+        #     "Describe the types of objects, their positions relative to the ego vehicle, and their potential motion."
+        # )
+        # key_map = (
+        #     "Focus only on static map-related elements. "
+        #     "Ignore all dynamic objects. "
+        #     "Describe road layout, lane dividers, boundaries, pedestrian crossings, and traffic signs."
+        # )
+        key_all = (
+            "Describe the entire driving scene in detail, covering all visible elements. "
+            "Include dynamic objects, their types, positions, and motions, as well as static elements like road structures, "
+            "traffic signs, lane markings, intersections, and any other relevant environmental features. "
+            "Additionally, assess and describe the current traffic congestion or road occupancy around the ego vehicle. "
+            "Also, describe the expected or planned motion state of the ego vehicle in the near future. "
+            "Provide a holistic understanding of the spatial layout, interactions, and ego vehicle's upcoming movements."
+        )
+        key_motion = (
+            "Focus exclusively on other dynamic objects in the scene. "
+            "Describe their types (e.g., vehicles, pedestrians, cyclists), relative positions to the ego vehicle, "
+            "and provide predictions about their possible motions or behaviors. "
+        )
+        key_map = (
+            "Describe only the static road and ground features. "
+            "Include lane markings, road boundaries, intersections, pedestrian crossings, traffic signs, and any other relevant road surface details. "
+            "Ignore all other dynamic objects."
+        )
+
         keys = [key_all, key_motion, key_map]
-        preset = ""
-        for cp in camera_positions:
-            preset += f"This is image from {cp}: <image>\n"
-        preset = preset + \
-                "These pictures are images from six perspectives provided by the ego vehicle. " \
-                "You need to parse images from different perspectives and generate a unified and uninterrupted textual description of the current scene. " \
-                "Please pay attention to distinguishing images from different perspectives " \
-                "and reasoning out the correct positional relationship between the objects and the ego vehicle in the picture. " \
+
 
         # 针对不同对象进行描述
         contents = []
         answers = []
+        answers_token = []
         for key in keys:
-            content = preset + key
             # 获取交互文本
             conversation = [
                 {
                     "role": "<|User|>",
-                    "content": content,
+                    "content": f'{key}\n\n{content_preset}',
                     "images": images_path,
                 },
                 {"role": "<|Assistant|>", "content": ""},
             ]
-
-            # load images and prepare for inputs
             pil_images = load_pil_images(conversation)
             prepare_inputs = vl_chat_processor(
                 conversations=conversation,
                 images=pil_images,
                 force_batchify=True,
-                system_prompt=""
+                system_prompt=system_prompt
             ).to(vl_gpt.device)
 
             # run image encoder to get the image embeddings
@@ -138,19 +150,26 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_gpt_la
                 pad_token_id=tokenizer.eos_token_id,
                 bos_token_id=tokenizer.bos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
-                max_new_tokens=512,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
                 use_cache=False
             )
 
-            answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
+            answer_token = outputs[0]
+            assert not (answer_token == 0.0).any(), 'There are [0] in answer_token'
+            assert len(answer_token) <= max_new_tokens, "The length of the answer is too long."
+            answer_token = answer_token.cpu().tolist()
+            answer = tokenizer.decode(answer_token, skip_special_tokens=True)
+            answer_token = answer_token + (max_new_tokens - len(answer_token)) * [None]  # 补充到统一的长度
 
-            contents.append(content)
+            contents.append(prepare_inputs['sft_format'])
             answers.append(answer)
+            answers_token.append(answer_token)
         # 保存生成的文本
         datas_info['description'] = {
             'contents': contents,
-            'answers': answers
+            'answers': answers,
+            'answers_token': answers_token
         }
         infos.append(datas_info)
 
