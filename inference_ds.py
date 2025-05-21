@@ -39,7 +39,7 @@ def get_model():
 
 def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_gpt_language, vl_chat_processor, tokenizer):
     # 读取pkl的数据
-    with open(os.path.join(path_GenAD, path_pkl), 'rb') as f:
+    with open(os.path.join(path_pkl), 'rb') as f:
         datas_from_pkl = pickle.load(f)
 
     # 相机位置和ID
@@ -81,21 +81,6 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_gpt_la
             "Do not describe images individually. Instead, integrate the visual information to reason about the environment, positions of objects, and scene layout relative to the ego vehicle."
         )
         # 设置不同key
-        # key_all = (
-        #     "Describe the scene completely, including dynamic objects (vehicles, pedestrians, bicycles), "
-        #     "their relative positions to the ego vehicle, road structures (lane dividers, boundaries, intersections), "
-        #     "traffic signs and lights, and make predictions about the motion of dynamic objects."
-        # )
-        # key_motion = (
-        #     "Focus only on dynamic objects. "
-        #     "Ignore all map elements such as lane dividers and traffic signs. "
-        #     "Describe the types of objects, their positions relative to the ego vehicle, and their potential motion."
-        # )
-        # key_map = (
-        #     "Focus only on static map-related elements. "
-        #     "Ignore all dynamic objects. "
-        #     "Describe road layout, lane dividers, boundaries, pedestrian crossings, and traffic signs."
-        # )
         key_all = (
             "Describe the entire driving scene in detail, covering all visible elements. "
             "Include dynamic objects, their types, positions, and motions, as well as static elements like road structures, "
@@ -174,7 +159,7 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_gpt_la
         infos.append(datas_info)
 
     # 保存成pkl文件
-    with open(os.path.join(path_GenAD, path_pkl_new), 'wb') as f:
+    with open(os.path.join(path_pkl_new), 'wb') as f:
         datas_from_pkl['infos'] = infos
         pickle.dump(datas_from_pkl, f)
 
@@ -183,17 +168,24 @@ if __name__ == '__main__':
     models = get_model()
 
     path_GenAD = '../GenAD'
-    path_datas_pkl = [
-        'data/nuscenes/vad_nuscenes_infos_temporal_train.pkl', 
-        'data/nuscenes/vad_nuscenes_infos_temporal_val.pkl'
-        # 'data/nuscenes/vad_nuscenes_infos_temporal_test.pkl'
+    # path_folder = '../GenAD/data/nuscenes/'
+    path_folder = '../GenAD/data/infos/full/'
+    datas_pkls = [
+        # 'vad_nuscenes_infos_temporal_train.pkl', 
+        'vad_nuscenes_infos_temporal_val.pkl',
+        'vad_nuscenes_infos_temporal_test.pkl'
     ]
-    path_datas_pkl_new = [
-        'data/nuscenes/vad_nuscenes_infos_temporal_train_with_description.pkl', 
-        'data/nuscenes/vad_nuscenes_infos_temporal_val_with_description.pkl',
-        # 'data/nuscenes/vad_nuscenes_infos_temporal_test_with_description.pkl'
+    datas_pkls_new = [
+        # 'vad_nuscenes_infos_temporal_train_with_description.pkl', 
+        'vad_nuscenes_infos_temporal_val_with_description.pkl',
+        'vad_nuscenes_infos_temporal_test_with_description.pkl'
     ]
 
-    for path_pkl, path_pkl_new in zip(path_datas_pkl, path_datas_pkl_new):
+    for data_pkls, datas_pkl_new in zip(datas_pkls, datas_pkls_new):
         with torch.no_grad():
-            process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, *models)
+            process_datas_from_pkl(
+                path_GenAD, 
+                os.path.join(path_folder, data_pkls),
+                os.path.join(path_folder, datas_pkl_new),
+                *models
+            )
