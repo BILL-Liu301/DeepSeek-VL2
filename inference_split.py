@@ -9,31 +9,50 @@ from deepspeed import init_inference
 from deepseek_vl2.models import DeepseekVLV2Processor, DeepseekVLV2ForCausalLM
 from deepseek_vl2.utils.io import load_pil_images
 
-model_path = "deepseek-ai/deepseek-vl2-tiny"
+model_path = "deepseek-ai/deepseek-vl2-small"
 size_per_device_GB = 4
 num_device = torch.cuda.device_count()
 max_new_tokens = 512
+
+def split_model(model_name):
+    device_map = {}
+    model_splits = {
+        'deepseek-ai/deepseek-vl2-tiny': [12], # 1 GPU
+        'deepseek-ai/deepseek-vl2-small': [13, 14], # 2 GPU
+        'deepseek-ai/deepseek-vl2': [10, 10, 10], # 3 GPU for 27b
+    }
+    num_layers_per_gpu = model_splits[model_name]
+    num_layers =  sum(num_layers_per_gpu)
+    layer_cnt = 0
+    for i, num_layer in enumerate(num_layers_per_gpu):
+        for j in range(num_layer):
+            device_map[f'language.model.layers.{layer_cnt}'] = i
+            layer_cnt += 1
+    device_map['vision'] = 0
+    device_map['projector'] = 0
+    device_map['image_newline'] = 0
+    device_map['view_seperator'] = 0
+    device_map['language.model.embed_tokens'] = 0
+    device_map['language.model.norm'] = 0
+    device_map['language.lm_head'] = 0
+    device_map[f'language.model.layers.{num_layers - 1}'] = 0
+    return device_map
 
 def get_model():
     # specify the path to the model
     vl_chat_processor: DeepseekVLV2Processor = DeepseekVLV2Processor.from_pretrained(model_path)
     tokenizer = vl_chat_processor.tokenizer
+    
+    device_map = split_model(model_path)
     vl_gpt: DeepseekVLV2ForCausalLM = AutoModelForCausalLM.from_pretrained(
         model_path,
+        torch_dtype=torch.bfloat16,
+        device_map=device_map,
         trust_remote_code=True
-    ).cuda().to(torch.bfloat16)
-    # 封装language
-    vl_gpt_language = init_inference(
-        vl_gpt.language,
-        mp_size=1,
-        dtype=torch.bfloat16,
-        replace_with_kernel_inject=True
-    )
-    vl_gpt.eval()
+    ).eval()
+    return vl_gpt, vl_chat_processor, tokenizer
 
-    return vl_gpt, vl_gpt_language, vl_chat_processor, tokenizer
-
-def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_gpt_language, vl_chat_processor, tokenizer):
+def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_chat_processor, tokenizer):
     # 读取pkl的数据
     with open(os.path.join(path_pkl), 'rb') as f:
         datas_from_pkl = pickle.load(f)
@@ -125,7 +144,7 @@ def process_datas_from_pkl(path_GenAD, path_pkl, path_pkl_new, vl_gpt, vl_gpt_la
             inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
 
             # run the model to get the response
-            outputs = vl_gpt_language.generate(
+            outputs = vl_gpt.language.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=prepare_inputs.attention_mask,
                 pad_token_id=tokenizer.eos_token_id,
